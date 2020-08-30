@@ -184,6 +184,17 @@ async function createLink(
   }
 }
 
+async function action(urls: string[], config: DownloadConfig): Promise<boolean> {
+  let caughtError = false;
+  for (const url of urls) {
+    await download(url, config).catch(e => {
+      console.error(e);
+      caughtError = true;
+    });
+  }
+  return caughtError === false;
+}
+
 /*
  ${destination}
    |- archive
@@ -244,9 +255,7 @@ caporal
       urls.push(line);
     });
     rl.on("close", async () => {
-      for (const url of urls) {
-        await download(url, config).catch(console.error);
-      }
+      while (!(await action(urls, config)));
     });
   });
 
