@@ -2,13 +2,159 @@ import caporal = require("caporal");
 import * as fs from "fs";
 import * as readline from "readline";
 import * as path from "path";
+import * as child_process from "child_process";
+import * as glob from "glob";
+import sanitize = require("sanitize-filename");
 
-async function download(
-  videoOrChannel: string,
-  config: { archive: string; meta: string; temporary: string }
-): Promise<void> {
-  //TODO:
+type DownloadConfig = {
+  archive: string;
+  meta: string;
+  link: string;
+  temporary: string;
+};
+
+const kRegChannelUrl = new RegExp("^https://www.youtube.com/channel/([^/]*)$");
+const kRegVideoUrl = new RegExp("^https://www.youtube.com/watch\\?v=(.*)$");
+
+async function mkdirp(d: string): Promise<void> {
+  await fs.promises.mkdir(d, { recursive: true });
+}
+
+async function download(url: string, config: DownloadConfig): Promise<void> {
+  const channelMatch = kRegChannelUrl.exec(url);
+  if (channelMatch) {
+    const channelId = channelMatch[1];
+    return await downloadChannel(channelId, config);
+  }
+
+  const videoMatch = kRegVideoUrl.exec(url);
+  if (videoMatch) {
+    const videoId = videoMatch[1];
+    return await downloadVideo(videoId, config);
+  }
+
+  console.warn(`url: "${url}" is not a YouTube url`);
   return Promise.resolve();
+}
+
+async function downloadChannel(
+  channelId: string,
+  config: DownloadConfig
+): Promise<void> {
+  //TODO
+  return Promise.resolve();
+}
+
+async function downloadVideo(
+  videoId: string,
+  config: DownloadConfig
+): Promise<void> {
+  const archivePath =
+    (await findVideoFile(videoId, config)) ??
+    (await spawnDownloader(videoId, config));
+  if (archivePath) {
+    await createLink(videoId, archivePath, config);
+  }
+}
+
+async function spawnDownloader(
+  videoId: string,
+  config: DownloadConfig
+): Promise<string | undefined> {
+  const { archive, meta, temporary } = config;
+  const d = path.join(temporary, `.${videoId}`);
+  await mkdirp(d);
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const list = path.join(meta, "all.txt");
+  await new Promise((resolve, reject) => {
+    const p = child_process.spawn(
+      `youtube-dl "${url}" --download-archive "${list}" --write-info-json --socket-timeout=20 --id`,
+      { cwd: d, stdio: "inherit", shell: true }
+    );
+    p.on("error", (e) => {
+      reject();
+    });
+    p.on("exit", (code) => {
+      if (code !== 0) {
+        reject();
+      } else {
+        resolve();
+      }
+    });
+  });
+  let archivePath: string | undefined;
+  for await (const file of await fs.promises.opendir(d)) {
+    if (!file.isFile()) {
+      continue;
+    }
+    const fullname = path.join(d, file.name);
+    if (file.name.endsWith(".info.json")) {
+      const destination = path.join(meta, file.name);
+      await fs.promises.rename(fullname, destination);
+    } else if (!archivePath) {
+      const destination = path.join(archive, file.name);
+      archivePath = destination;
+      await fs.promises.rename(fullname, destination);
+    }
+  }
+  await fs.promises.rmdir(d, { recursive: true });
+  return archivePath;
+}
+
+async function findVideoFile(
+  videoId,
+  config: DownloadConfig
+): Promise<string | undefined> {
+  const { archive } = config;
+  return new Promise((resolve, reject) => {
+    glob(path.join(archive, `${videoId}.*`), (err, matches: string[]) => {
+      if (err) {
+        reject();
+        return;
+      }
+      if (matches.length === 1) {
+        resolve(matches[0]);
+      } else {
+        resolve(undefined);
+      }
+    });
+  });
+}
+
+async function createLink(
+  videoId: string,
+  archivePath: string,
+  config: DownloadConfig
+): Promise<void> {
+  const { meta, link } = config;
+  const json: string = (
+    await fs.promises.readFile(path.join(meta, `${videoId}.info.json`))
+  ).toString("utf-8");
+  const info = JSON.parse(json);
+  const upload_date: string = info["upload_date"]; // yyyymmdd
+  const fulltitle: string = sanitize(info["fulltitle"]);
+  const uploader: string = sanitize(info["uploader"]); // === channel_name
+  const year = upload_date.substr(0, 4);
+  const month = upload_date.substr(4, 2);
+  const day = upload_date.substr(6, 2);
+  const ext = path.extname(archivePath);
+  const byChannelDir = path.join(link, "byChannel", uploader);
+  const byDateDir = path.join(link, "byDate", year, month);
+  await mkdirp(byChannelDir);
+  await mkdirp(byDateDir);
+  const linkByChannel = path.join(
+    byChannelDir,
+    `${upload_date}_${fulltitle}_${videoId}${ext}`
+  );
+  const linkByDate = path.join(
+    byDateDir,
+    `${day}_${uploader}_${fulltitle}_${videoId}${ext}`
+  );
+  for await (const linkDestination of [linkByChannel, linkByDate]) {
+    await fs.promises.stat(linkDestination).catch(() => {
+      return fs.promises.link(archivePath, linkDestination);
+    });
+  }
 }
 
 /*
@@ -22,11 +168,11 @@ async function download(
    |- link
    |   |- byChannel
    |   |   `- ${channel_name}
-   |   |       `- ${year}${month}${day}_${video_title}.mp4 (link to archive/${video_id}.mp4)
+   |   |       `- ${year}${month}${day}_${video_title}_${video_id}.mp4 (link to archive/${video_id}.mp4)
    |   `- byDate
    |       `- ${year}
    |           `- ${month}
-   |               `- ${day}_${channel_name}_${video_title}.mp4 (link to archive/${video_id}.mp4)
+   |               `- ${day}_${channel_name}_${video_title}_${video_id}.mp4 (link to archive/${video_id}.mp4)
    `- .temporary
        `- .${video_id}
            |- ${video_id}.f137.mp4.part
@@ -55,17 +201,24 @@ caporal
     const archive = path.join(destination, "archive");
     const meta = path.join(destination, "meta");
     const temporary = path.join(destination, ".temporary");
-    for (const dir of [archive, meta, temporary]) {
-      await fs.promises.mkdir(dir, { recursive: true });
+    const link = path.join(destination, "link");
+    for (const dir of [archive, meta, temporary, link]) {
+      await mkdirp(dir);
     }
-    const videos: string[] = [];
+    const config: DownloadConfig = {
+      archive: path.resolve(archive),
+      meta: path.resolve(meta),
+      link: path.resolve(link),
+      temporary: path.resolve(temporary),
+    };
+    const urls: string[] = [];
     const rl = readline.createInterface(process.stdin);
     rl.on("line", (line) => {
-      videos.push(line);
+      urls.push(line);
     });
     rl.on("close", async () => {
-      for (const id of videos) {
-        await download(id, { archive, meta, temporary });
+      for (const url of urls) {
+        await download(url, config).catch(console.error);
       }
     });
   });
