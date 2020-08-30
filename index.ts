@@ -222,13 +222,12 @@ caporal
   .option(
     "--destination <directory>",
     "Archive destination directory",
-    caporal.STRING
+    caporal.STRING,
+    undefined,
+    true
   )
   .action(async (args, options, logger) => {
     const destination = options["destination"];
-    if (!destination) {
-      throw new Error("--destination not specified");
-    }
     const stat = await fs.promises.stat(destination);
     if (!stat) {
       throw new Error(`directory "${destination}" does not exist`);
