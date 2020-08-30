@@ -41,8 +41,35 @@ async function downloadChannel(
   channelId: string,
   config: DownloadConfig
 ): Promise<void> {
-  //TODO
-  return Promise.resolve();
+  const { meta } = config;
+  const url = `https://www.youtube.com/channel/${channelId}`;
+  const list = path.join(meta, "all.txt");
+  const ids = await new Promise<string[]>((resolve, reject) => {
+    const p = child_process.spawn(
+      `youtube-dl --get-id --download-archive "${list}" --playlist-reverse "${url}"`,
+      { shell: true }
+    );
+    let stdout = "";
+    p.on("error", reject);
+    p.on("exit", (code) => {
+      if (code !== 0) {
+        reject();
+      } else {
+        resolve(
+          stdout
+            .split("\n")
+            .map((it) => it.trim())
+            .filter((it) => it.length > 0)
+        );
+      }
+    });
+    p.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+  });
+  for (const videoId of ids) {
+    await downloadVideo(videoId, config);
+  }
 }
 
 async function downloadVideo(
