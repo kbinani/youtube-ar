@@ -5,16 +5,19 @@ import * as path from "path";
 import * as child_process from "child_process";
 import * as glob from "glob";
 import sanitize = require("sanitize-filename");
+import * as os from "os";
 
 type DownloadConfig = {
   archive: string;
   meta: string;
   link: string;
   temporary: string;
+  archiveListFile: string; // youtube-dl tries to lock all.txt. This fails with smb and nfs, so put all.txt in tmp during execution
 };
 
 const kRegChannelUrl = new RegExp("^https://www.youtube.com/channel/([^/]*)$");
 const kRegVideoUrl = new RegExp("^https://www.youtube.com/watch\\?v=(.*)$");
+const kRegYouTubeSaid = new RegExp("^.*YouTube said: (.*)$", "m");
 
 async function mkdirp(d: string): Promise<void> {
   await fs.promises.mkdir(d, { recursive: true });
@@ -41,35 +44,46 @@ async function downloadChannel(
   channelId: string,
   config: DownloadConfig
 ): Promise<void> {
-  const { meta } = config;
+  const { archive, meta, archiveListFile, temporary } = config;
   const url = `https://www.youtube.com/channel/${channelId}`;
-  const list = path.join(meta, "all.txt");
-  const ids = await new Promise<string[]>((resolve, reject) => {
+  const d = path.join(temporary, `${channelId}`);
+  await mkdirp(d);
+  await new Promise((resolve, reject) => {
     const p = child_process.spawn(
-      `youtube-dl --get-id --download-archive "${list}" --playlist-reverse "${url}"`,
-      { shell: true }
+      `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id --playlist-reverse`,
+      { shell: true, cwd: d, stdio: "inherit" }
     );
-    let stdout = "";
-    p.on("error", reject);
+    p.on("error", (e) => {
+      console.error(e);
+      reject(e);
+    });
     p.on("exit", (code) => {
-      if (code !== 0) {
-        reject();
+      if (code === 0) {
+        resolve();
       } else {
-        resolve(
-          stdout
-            .split("\n")
-            .map((it) => it.trim())
-            .filter((it) => it.length > 0)
-        );
+        reject();
       }
     });
-    p.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
   });
-  for (const videoId of ids) {
-    await downloadVideo(videoId, config);
+  for await (const file of await fs.promises.opendir(d)) {
+    if (!file.isFile()) {
+      continue;
+    }
+    if (!file.name.endsWith(".info.json")) {
+      continue;
+    }
+    const infoFullName = path.join(d, file.name);
+    const infoDestination = path.join(meta, file.name);
+    const videoId = file.name.substr(0, file.name.length - ".info.json".length);
+    const videoFullName = await findVideoFile(videoId, d);
+    if (!videoFullName) {
+      continue;
+    }
+    const videoDestination = path.join(archive, path.basename(videoFullName));
+    await fs.promises.rename(infoFullName, infoDestination);
+    await fs.promises.rename(videoFullName, videoDestination);
   }
+  await fs.promises.rmdir(d, { recursive: true });
 }
 
 async function downloadVideo(
@@ -77,7 +91,7 @@ async function downloadVideo(
   config: DownloadConfig
 ): Promise<void> {
   const archivePath =
-    (await findVideoFile(videoId, config)) ??
+    (await findVideoFile(videoId, config.archive)) ??
     (await spawnDownloader(videoId, config));
   if (archivePath) {
     await createLink(videoId, archivePath, config);
@@ -88,25 +102,47 @@ async function spawnDownloader(
   videoId: string,
   config: DownloadConfig
 ): Promise<string | undefined> {
-  const { archive, meta, temporary } = config;
+  const { archive, meta, archiveListFile, temporary } = config;
   const d = path.join(temporary, `.${videoId}`);
   await mkdirp(d);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const list = path.join(meta, "all.txt");
   await new Promise((resolve, reject) => {
+    let youtubeSaidSomething = "";
     const p = child_process.spawn(
-      `youtube-dl "${url}" --download-archive "${list}" --write-info-json --socket-timeout=20 --id`,
-      { cwd: d, stdio: "inherit", shell: true }
+      `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id`,
+      { cwd: d, shell: true }
     );
     p.on("error", (e) => {
-      reject();
+      if (e) {
+        console.error(e);
+      }
+      reject(e);
     });
-    p.on("exit", (code) => {
+    p.on("exit", async (code) => {
       if (code !== 0) {
-        reject();
+        if (youtubeSaidSomething) {
+          await fs.promises.appendFile(
+            archiveListFile,
+            `# {id=${videoId}, date=${new Date().toISOString()}} YouTube said: ${youtubeSaidSomething}\nyoutube ${videoId}\n`
+          );
+          resolve();
+        } else {
+          reject();
+        }
       } else {
         resolve();
       }
+    });
+    p.stderr.on("data", (chunk: Buffer) => {
+      const data = chunk.toString("utf-8");
+      const match = kRegYouTubeSaid.exec(data);
+      if (match) {
+        youtubeSaidSomething = match[1];
+      }
+      console.error(chunk.toString("utf-8").trimRight());
+    });
+    p.stdout.on("data", (chunk: Buffer) => {
+      console.log(chunk.toString("utf-8").trimRight());
     });
   });
   let archivePath: string | undefined;
@@ -130,17 +166,17 @@ async function spawnDownloader(
 
 async function findVideoFile(
   videoId,
-  config: DownloadConfig
+  dir: string
 ): Promise<string | undefined> {
-  const { archive } = config;
   return new Promise((resolve, reject) => {
-    glob(path.join(archive, `${videoId}.*`), (err, matches: string[]) => {
+    glob(path.join(dir, `${videoId}.*`), (err, matches: string[]) => {
       if (err) {
         reject();
         return;
       }
-      if (matches.length === 1) {
-        resolve(matches[0]);
+      const files = matches.filter((it) => !it.endsWith(".info.json"));
+      if (files.length === 1) {
+        resolve(files[0]);
       } else {
         resolve(undefined);
       }
@@ -184,15 +220,76 @@ async function createLink(
   }
 }
 
-async function action(urls: string[], config: DownloadConfig): Promise<boolean> {
+async function action(
+  urls: string[],
+  config: DownloadConfig
+): Promise<{ next: string[]; ok: boolean }> {
   let caughtError = false;
+  const next: string[] = [];
   for (const url of urls) {
-    await download(url, config).catch(e => {
+    await download(url, config).catch((e) => {
       console.error(e);
       caughtError = true;
+      next.push(url);
     });
   }
-  return caughtError === false;
+  return { next, ok: caughtError === false };
+}
+
+async function isFileSystemLockable(s: string): Promise<boolean> {
+  if (process.platform === "darwin") {
+    return new Promise((resolve, reject) => {
+      const df = child_process.spawn("df", [s]);
+      const tail = child_process.spawn("tail", ["-1"]);
+      const awk = child_process.spawn("awk", ["{print $1}"]);
+      df.stdout.pipe(tail.stdin);
+      tail.stdout.pipe(awk.stdin);
+      let filesystem = "";
+      awk.stdout.on("data", (chunk: Buffer) => {
+        filesystem += chunk.toString("utf-8");
+      });
+      awk.on("exit", () => {
+        filesystem = filesystem.trim();
+        const mount = child_process.spawn("mount");
+        const grep = child_process.spawn("grep", [`${filesystem}`]);
+        mount.stdout.pipe(grep.stdin);
+        let out = "";
+        grep.stdout.on("data", (chunk: Buffer) => {
+          out += chunk.toString("utf-8");
+        });
+        grep.on("exit", (code) => {
+          if (code === 0) {
+            out = out.trim();
+            const m = out.match(/^.*\(([a-z]*), .*\).*$/);
+            if (m) {
+              const type = m[1];
+              if (type === "nfs" || type === "smbfs") {
+                resolve(false);
+              } else if (type === "apfs") {
+                resolve(true);
+              } else {
+                console.warn(`unknown file system: "${type}"`);
+                resolve(true);
+              }
+            } else {
+              reject();
+            }
+          } else {
+            reject();
+          }
+        });
+
+        mount.on("error", reject);
+        grep.on("error", reject);
+      });
+
+      df.on("error", reject);
+      tail.on("error", reject);
+      awk.on("error", reject);
+    });
+  } else {
+    return true;
+  }
 }
 
 /*
@@ -237,16 +334,24 @@ caporal
     }
     const archive = path.join(destination, "archive");
     const meta = path.join(destination, "meta");
-    const temporary = path.join(destination, ".temporary");
+    const temporary = path.join(destination, "temporary");
     const link = path.join(destination, "link");
     for (const dir of [archive, meta, temporary, link]) {
       await mkdirp(dir);
+    }
+    const defaultArchiveFileList = path.join(path.resolve(meta), "all.txt");
+    let archiveListFile = defaultArchiveFileList;
+    let tempdir: string | undefined;
+    if (!(await isFileSystemLockable(path.resolve(meta)))) {
+      tempdir = await fs.promises.mkdtemp(os.tmpdir());
+      archiveListFile = path.join(tempdir, "all.txt");
     }
     const config: DownloadConfig = {
       archive: path.resolve(archive),
       meta: path.resolve(meta),
       link: path.resolve(link),
       temporary: path.resolve(temporary),
+      archiveListFile,
     };
     const urls: string[] = [];
     const rl = readline.createInterface(process.stdin);
@@ -254,7 +359,23 @@ caporal
       urls.push(line);
     });
     rl.on("close", async () => {
-      while (!(await action(urls, config)));
+      if (archiveListFile !== defaultArchiveFileList) {
+        await fs.promises.copyFile(defaultArchiveFileList, archiveListFile);
+      }
+      let list = urls;
+      while (true) {
+        const { ok, next } = await action(list, config);
+        if (ok) {
+          break;
+        }
+        list = next;
+      }
+      if (archiveListFile !== defaultArchiveFileList) {
+        await fs.promises.copyFile(archiveListFile, defaultArchiveFileList);
+      }
+      if (tempdir) {
+        await fs.promises.rmdir(tempdir, { recursive: true });
+      }
     });
   });
 
