@@ -69,18 +69,24 @@ async function downloadChannel(
       `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id --playlist-reverse`,
       { shell: true, cwd: d, stdio: "inherit" }
     );
+    const handleSignal = (sig) => {
+      p.kill(sig);
+      process.exit(1);
+    };
+    process.on("SIGINT", handleSignal);
+    process.on("SIGTERM", handleSignal);
     p.on("error", (e) => {
       reject(e);
     });
     p.on("exit", (code) => {
+      process.removeListener("SIGINT", handleSignal);
+      process.removeListener("SIGTERM", handleSignal);
       if (code === 0) {
         resolve();
       } else {
         reject();
       }
     });
-    process.on("SIGINT", (sig) => p.kill(sig));
-    process.on("SIGTERM", (sig) => p.kill(sig));
   }).catch(console.error);
   for await (const file of await fs.promises.opendir(d)) {
     if (!file.isFile()) {
@@ -129,6 +135,12 @@ async function spawnDownloader(
       `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id`,
       { cwd: d, shell: true }
     );
+    const handleSignal = (sig) => {
+      p.kill(sig);
+      process.exit(1);
+    };
+    process.on("SIGINT", handleSignal);
+    process.on("SIGTERM", handleSignal);
     p.on("error", (e) => {
       if (e) {
         console.error(e);
@@ -136,6 +148,8 @@ async function spawnDownloader(
       reject(e);
     });
     p.on("exit", async (code) => {
+      process.removeListener("SIGINT", handleSignal);
+      process.removeListener("SIGTERM", handleSignal);
       if (code !== 0) {
         if (youtubeSaidSomething) {
           await fs.promises.appendFile(
@@ -159,8 +173,6 @@ async function spawnDownloader(
       console.error(chunk.toString("utf-8").trimRight());
     });
     p.stdout.pipe(process.stdout);
-    process.on("SIGINT", (sig) => p.kill(sig));
-    process.on("SIGTERM", (sig) => p.kill(sig));
   });
   let archivePath: string | undefined;
   for await (const file of await fs.promises.opendir(d)) {
