@@ -315,7 +315,7 @@ async function isFileSystemLockable(s: string): Promise<boolean> {
 */
 
 caporal
-  .command("start", "")
+  .command("download", "")
   .option(
     "--destination <directory>",
     "Archive destination directory",
