@@ -70,7 +70,6 @@ async function downloadChannel(
       { shell: true, cwd: d, stdio: "inherit" }
     );
     p.on("error", (e) => {
-      console.error(e);
       reject(e);
     });
     p.on("exit", (code) => {
@@ -80,7 +79,9 @@ async function downloadChannel(
         reject();
       }
     });
-  });
+    process.on("SIGINT", (sig) => p.kill(sig));
+    process.on("SIGTERM", (sig) => p.kill(sig));
+  }).catch(console.error);
   for await (const file of await fs.promises.opendir(d)) {
     if (!file.isFile()) {
       continue;
@@ -157,9 +158,9 @@ async function spawnDownloader(
       }
       console.error(chunk.toString("utf-8").trimRight());
     });
-    p.stdout.on("data", (chunk: Buffer) => {
-      console.log(chunk.toString("utf-8").trimRight());
-    });
+    p.stdout.pipe(process.stdout);
+    process.on("SIGINT", (sig) => p.kill(sig));
+    process.on("SIGTERM", (sig) => p.kill(sig));
   });
   let archivePath: string | undefined;
   for await (const file of await fs.promises.opendir(d)) {
