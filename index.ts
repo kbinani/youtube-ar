@@ -19,6 +19,23 @@ const kRegChannelUrl = new RegExp("^https://www.youtube.com/channel/([^/]*)$");
 const kRegVideoUrl = new RegExp("^https://www.youtube.com/watch\\?v=(.*)$");
 const kRegYouTubeSaid = new RegExp("^.*YouTube said: (.*)$", "m");
 
+class CriticalError extends Error {}
+class InfoParseError extends CriticalError {
+  constructor(readonly videoId) {
+    super(`${videoId}.info.json parse error`);
+  }
+}
+class MultipleVideoFoundError extends CriticalError {
+  constructor(readonly videoId, readonly numVideoFiles: number) {
+    super(`${numVideoFiles} video files found for videoId: ${videoId}`);
+  }
+}
+class InvalidUrlError extends CriticalError {
+  constructor(readonly url) {
+    super(`${url} is not a YouTube url`);
+  }
+}
+
 async function mkdirp(d: string): Promise<void> {
   await fs.promises.mkdir(d, { recursive: true });
 }
@@ -36,8 +53,7 @@ async function download(url: string, config: DownloadConfig): Promise<void> {
     return await downloadVideo(videoId, config);
   }
 
-  console.warn(`url: "${url}" is not a YouTube url`);
-  return Promise.resolve();
+  throw new InvalidUrlError(url);
 }
 
 async function downloadChannel(
@@ -164,10 +180,7 @@ async function spawnDownloader(
   return archivePath;
 }
 
-async function findVideoFile(
-  videoId,
-  dir: string
-): Promise<string | undefined> {
+function findVideoFile(videoId, dir: string): Promise<string | undefined> {
   return new Promise((resolve, reject) => {
     glob(path.join(dir, `${videoId}.*`), (err, matches: string[]) => {
       if (err) {
@@ -177,8 +190,10 @@ async function findVideoFile(
       const files = matches.filter((it) => !it.endsWith(".info.json"));
       if (files.length === 1) {
         resolve(files[0]);
-      } else {
+      } else if (files.length === 0) {
         resolve(undefined);
+      } else {
+        reject(new MultipleVideoFoundError(videoId, files.length));
       }
     });
   });
@@ -193,7 +208,12 @@ async function createLink(
   const json: string = (
     await fs.promises.readFile(path.join(meta, `${videoId}.info.json`))
   ).toString("utf-8");
-  const info = JSON.parse(json);
+  let info;
+  try {
+    info = JSON.parse(json);
+  } catch (e) {
+    throw new InfoParseError(videoId);
+  }
   const upload_date: string = info["upload_date"]; // yyyymmdd
   const fulltitle: string = sanitize(info["fulltitle"]);
   const uploader: string = sanitize(info["uploader"]); // === channel_name
@@ -229,6 +249,9 @@ async function action(
   for (const url of urls) {
     await download(url, config).catch((e) => {
       console.error(e);
+      if (e instanceof CriticalError) {
+        process.exit(1);
+      }
       caughtError = true;
       next.push(url);
     });
