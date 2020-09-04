@@ -225,18 +225,49 @@ async function createLink(
   const byDateDir = path.join(link, "byDate", year, month);
   await mkdirp(byChannelDir);
   await mkdirp(byDateDir);
-  const linkByChannel = path.join(
-    byChannelDir,
-    `${upload_date}_${fulltitle}_${videoId}${ext}`
-  );
-  const linkByDate = path.join(
-    byDateDir,
-    `${day}_${uploader}_${fulltitle}_${videoId}${ext}`
-  );
-  for await (const linkDestination of [linkByChannel, linkByDate]) {
-    await fs.promises.stat(linkDestination).catch(() => {
-      return fs.promises.link(archivePath, linkDestination);
-    });
+  await fsLink(archivePath, byChannelDir, {
+    leading: `${upload_date}_`,
+    main: fulltitle,
+    trailing: `_${videoId}${ext}`,
+  });
+  await fsLink(archivePath, byDateDir, {
+    leading: `${day}_${uploader}_`,
+    main: fulltitle,
+    trailing: `_${videoId}${ext}`,
+  });
+}
+
+async function fsExists(p: string): Promise<boolean> {
+  try {
+    await fs.promises.stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fsLink(
+  existingPath: string,
+  dir: string,
+  filename: { leading: string; main: string; trailing: string }
+): Promise<void> {
+  const { leading, main, trailing } = filename;
+  let current = main;
+  while (true) {
+    const newPath = path.join(dir, `${leading}${current}${trailing}`);
+    if (await fsExists(newPath)) {
+      break;
+    }
+    try {
+      await fs.promises.link(existingPath, newPath);
+      break;
+    } catch (e) {
+      if (e.code === "ENAMETOOLONG") {
+        current = current.substr(0, current.length - 1);
+      } else {
+        throw e;
+      }
+    }
   }
 }
 
