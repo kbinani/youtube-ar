@@ -40,16 +40,28 @@ async function mkdirp(d: string): Promise<void> {
   await fs.promises.mkdir(d, { recursive: true });
 }
 
-async function download(url: string, config: DownloadConfig): Promise<void> {
+function parseUrl(url: string): { videoId?: string; channelId?: string } {
   const channelMatch = kRegChannelUrl.exec(url);
   if (channelMatch) {
     const channelId = channelMatch[1];
-    return await downloadChannel(channelId, config);
+    return { channelId };
   }
 
   const videoMatch = kRegVideoUrl.exec(url);
   if (videoMatch) {
     const videoId = videoMatch[1];
+    return { videoId };
+  }
+  return {};
+}
+
+async function download(url: string, config: DownloadConfig): Promise<void> {
+  const { videoId, channelId } = parseUrl(url);
+  if (channelId) {
+    return await downloadChannel(channelId, config);
+  }
+
+  if (videoId) {
     return await downloadVideo(videoId, config);
   }
 
@@ -284,15 +296,29 @@ async function fsLink(
   }
 }
 
+type DownloadContext = {
+  config: DownloadConfig;
+  progress: Progress;
+};
+
 async function action(
   urls: string[],
-  config: DownloadConfig
+  context: DownloadContext
 ): Promise<{ next: string[]; ok: boolean }> {
+  const { config, progress } = context;
+  const { numVideos, numChannels, finishedVideos } = progress;
   let caughtError = false;
   const next: string[] = [];
+  let i = 0;
   for (const url of urls) {
+    i++;
+    console.log(`------------------------------------------------------------`);
+    console.log(
+      `[${i}/${numVideos + numChannels - finishedVideos}/${
+        numVideos + numChannels
+      }] ${url}`
+    );
     await download(url, config).catch((e) => {
-      console.error(e);
       if (e instanceof CriticalError) {
         process.exit(1);
       }
@@ -359,6 +385,60 @@ async function isFileSystemLockable(s: string): Promise<boolean> {
   }
 }
 
+type Progress = {
+  numVideos: number;
+  numChannels: number;
+  finishedVideos: number;
+};
+
+async function currentProgress(
+  urls: string[],
+  config: DownloadConfig
+): Promise<{ progress: Progress; urls: string[] }> {
+  const { archive, meta } = config;
+  const archiveFiles: string[] = [];
+  for await (const file of await fs.promises.opendir(archive)) {
+    if (file.isFile()) {
+      archiveFiles.push(path.basename(file.name));
+    }
+  }
+  const metaFiles: string[] = [];
+  for await (const file of await fs.promises.opendir(meta)) {
+    if (file.isFile()) {
+      metaFiles.push(path.basename(file.name));
+    }
+  }
+  const nextUrls: string[] = [];
+  let numVideos = 0;
+  let numChannels = 0;
+  let finishedVideos = 0;
+  for (const url of urls) {
+    const { videoId, channelId } = parseUrl(url);
+    if (channelId) {
+      numChannels++;
+      nextUrls.push(url);
+    } else if (videoId) {
+      numVideos++;
+      const metaOk = metaFiles.indexOf(`${videoId}.info.json`) > -1;
+      const count = archiveFiles.reduce((prev, current) => {
+        if (current.startsWith(videoId)) {
+          return prev + 1;
+        } else {
+          return prev;
+        }
+      }, 0);
+      const videoOk = count === 1;
+      if (metaOk && videoOk) {
+        finishedVideos++;
+      } else {
+        nextUrls.push(url);
+      }
+    }
+  }
+  const progress: Progress = { numVideos, numChannels, finishedVideos };
+  return { progress, urls: nextUrls };
+}
+
 /*
  ${destination}
    |- archive
@@ -420,18 +500,20 @@ caporal
       temporary: path.resolve(temporary),
       archiveListFile,
     };
-    const urls: string[] = [];
+    const inputUrls: string[] = [];
     const rl = readline.createInterface(process.stdin);
     rl.on("line", (line) => {
-      urls.push(line);
+      inputUrls.push(line);
     });
     rl.on("close", async () => {
       if (archiveListFile !== defaultArchiveFileList) {
         await fs.promises.copyFile(defaultArchiveFileList, archiveListFile);
       }
+      const { progress, urls } = await currentProgress(inputUrls, config);
+      const context: DownloadContext = { config, progress };
       let list = urls;
       while (true) {
-        const { ok, next } = await action(list, config);
+        const { ok, next } = await action(list, context);
         if (ok) {
           break;
         }
