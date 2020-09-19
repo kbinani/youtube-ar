@@ -1,5 +1,6 @@
 import caporal = require("caporal");
 import { downloadAction } from "./src/download";
+import { listAction } from "./src/list";
 
 /*
  ${destination}
@@ -33,5 +34,17 @@ caporal
     true
   )
   .action(downloadAction);
+
+caporal
+  .command("list", "")
+  .option(
+    "--destination <directory>",
+    "Archive destination directory",
+    caporal.STRING,
+    undefined,
+    true
+  )
+  .argument("<what-to-listup>", "'incomplete'", "")
+  .action(listAction);
 
 caporal.parse(process.argv);
