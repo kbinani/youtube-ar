@@ -11,7 +11,7 @@ type DownloadConfig = {
   meta: string;
   link: string;
   temporary: string;
-  archiveListFile: string; // youtube-dl tries to lock all.txt. This fails with smb and nfs, so put all.txt in tmp during execution
+  isFileSystemLockable: boolean;
 };
 
 const kRegChannelUrl = new RegExp("^https://www.youtube.com/channel/([^/]*)$");
@@ -71,32 +71,34 @@ async function downloadChannel(
   channelId: string,
   config: DownloadConfig
 ): Promise<void> {
-  const { archive, meta, archiveListFile, temporary } = config;
+  const { archive, meta, temporary } = config;
   const url = `https://www.youtube.com/channel/${channelId}`;
   const d = path.join(temporary, `${channelId}`);
   await mkdirp(d);
-  await new Promise((resolve, reject) => {
-    const p = child_process.spawn(
-      `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id --playlist-reverse`,
-      { shell: true, cwd: d, stdio: "inherit" }
-    );
-    const handleSignal = (sig) => {
-      p.kill(sig);
-      process.exit(1);
-    };
-    process.on("SIGINT", handleSignal);
-    process.on("SIGTERM", handleSignal);
-    p.on("error", (e) => {
-      reject(e);
-    });
-    p.on("exit", (code) => {
-      process.removeListener("SIGINT", handleSignal);
-      process.removeListener("SIGTERM", handleSignal);
-      if (code === 0) {
-        resolve();
-      } else {
-        reject();
-      }
+  await useArchiveListFile(config, (archiveListFile: string) => {
+    return new Promise((resolve, reject) => {
+      const p = child_process.spawn(
+        `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id --playlist-reverse`,
+        { shell: true, cwd: d, stdio: "inherit" }
+      );
+      const handleSignal = (sig) => {
+        p.kill(sig);
+        process.exit(1);
+      };
+      process.on("SIGINT", handleSignal);
+      process.on("SIGTERM", handleSignal);
+      p.on("error", (e) => {
+        reject(e);
+      });
+      p.on("exit", (code) => {
+        process.removeListener("SIGINT", handleSignal);
+        process.removeListener("SIGTERM", handleSignal);
+        if (code === 0) {
+          resolve();
+        } else {
+          reject();
+        }
+      });
     });
   }).catch(console.error);
   for await (const file of await fs.promises.opendir(d)) {
@@ -136,55 +138,67 @@ async function spawnDownloader(
   videoId: string,
   config: DownloadConfig
 ): Promise<string | undefined> {
-  const { archive, meta, archiveListFile, temporary } = config;
+  const { archive, meta, temporary } = config;
   const d = path.join(temporary, `${videoId}`);
   await mkdirp(d);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  await new Promise((resolve, reject) => {
-    let youtubeSaidSomething = "";
-    const p = child_process.spawn(
-      `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id`,
-      { cwd: d, shell: true }
-    );
-    const handleSignal = (sig) => {
-      p.kill(sig);
-      process.exit(1);
-    };
-    process.on("SIGINT", handleSignal);
-    process.on("SIGTERM", handleSignal);
-    p.on("error", (e) => {
-      if (e) {
-        console.error(e);
-      }
-      reject(e);
-    });
-    p.on("exit", async (code) => {
-      process.removeListener("SIGINT", handleSignal);
-      process.removeListener("SIGTERM", handleSignal);
-      if (code !== 0) {
-        if (youtubeSaidSomething) {
-          await fs.promises.appendFile(
-            archiveListFile,
-            `# {id=${videoId}, date=${new Date().toISOString()}} YouTube said: ${youtubeSaidSomething}\nyoutube ${videoId}\n`
-          );
-          resolve();
-        } else {
-          reject();
+
+  await useArchiveListFile(config, (archiveListFile: string) => {
+    return new Promise((resolve, reject) => {
+      let youtubeSaidSomething = "";
+      const p = child_process.spawn(
+        `youtube-dl "${url}" --download-archive "${archiveListFile}" --write-info-json --socket-timeout=20 --id`,
+        { cwd: d, shell: true }
+      );
+      const handleSignal = (sig) => {
+        p.kill(sig);
+        process.exit(1);
+      };
+      process.on("SIGINT", handleSignal);
+      process.on("SIGTERM", handleSignal);
+      p.on("error", (e) => {
+        if (e) {
+          console.error(e);
         }
-      } else {
-        resolve();
-      }
+        reject(e);
+      });
+      p.on("exit", async (code) => {
+        process.removeListener("SIGINT", handleSignal);
+        process.removeListener("SIGTERM", handleSignal);
+        console.log(
+          `spawnDownloader; p.on(exit); code=${code}; youtubeSaidSomething=${youtubeSaidSomething}`
+        );
+        if (code !== 0) {
+          if (youtubeSaidSomething) {
+            await fs.promises
+              .appendFile(
+                archiveListFile,
+                `# {id=${videoId}, date=${new Date().toISOString()}} YouTube said: ${youtubeSaidSomething}\nyoutube ${videoId}\n`
+              )
+              .catch(console.error);
+            resolve();
+          } else {
+            reject();
+          }
+        } else {
+          resolve();
+        }
+      });
+      p.stderr.on("data", (chunk: Buffer) => {
+        const data = chunk.toString("utf-8");
+        const match = kRegYouTubeSaid.exec(data);
+        if (match) {
+          youtubeSaidSomething = match[1];
+          console.log(
+            `spawnDownloader, p.stderr.on(data); youtubeSaidSomething=${youtubeSaidSomething}`
+          );
+        }
+        console.error(chunk.toString("utf-8").trimRight());
+      });
+      p.stdout.pipe(process.stdout);
     });
-    p.stderr.on("data", (chunk: Buffer) => {
-      const data = chunk.toString("utf-8");
-      const match = kRegYouTubeSaid.exec(data);
-      if (match) {
-        youtubeSaidSomething = match[1];
-      }
-      console.error(chunk.toString("utf-8").trimRight());
-    });
-    p.stdout.pipe(process.stdout);
   });
+
   let archivePath: string | undefined;
   for await (const file of await fs.promises.opendir(d)) {
     if (!file.isFile()) {
@@ -202,6 +216,31 @@ async function spawnDownloader(
   }
   await fs.promises.rmdir(d, { recursive: true });
   return archivePath;
+}
+
+async function useArchiveListFile(
+  config: DownloadConfig,
+  cb: (archiveListFile: string) => Promise<void>
+): Promise<void> {
+  const { meta, isFileSystemLockable } = config;
+  const defaultArchiveListFile = path.join(meta, "all.txt");
+  let archiveListFile: string;
+  let tempdir: string;
+  if (isFileSystemLockable) {
+    archiveListFile = defaultArchiveListFile;
+  } else {
+    // youtube-dl tries to lock all.txt. This fails with smb and nfs, so put all.txt in tmp during execution
+    tempdir = await fs.promises.mkdtemp(os.tmpdir());
+    archiveListFile = path.join(tempdir, "all.txt");
+    await fs.promises.copyFile(defaultArchiveListFile, archiveListFile);
+  }
+
+  await cb(archiveListFile);
+
+  if (!isFileSystemLockable) {
+    await fs.promises.copyFile(archiveListFile, defaultArchiveListFile);
+    await fs.promises.unlink(tempdir);
+  }
 }
 
 export function findVideoFile(
@@ -457,19 +496,12 @@ export async function downloadAction(args, options) {
   for (const dir of [archive, meta, temporary, link]) {
     await mkdirp(dir);
   }
-  const defaultArchiveFileList = path.join(path.resolve(meta), "all.txt");
-  let archiveListFile = defaultArchiveFileList;
-  let tempdir: string | undefined;
-  if (!(await isFileSystemLockable(path.resolve(meta)))) {
-    tempdir = await fs.promises.mkdtemp(os.tmpdir());
-    archiveListFile = path.join(tempdir, "all.txt");
-  }
   const config: DownloadConfig = {
     archive: path.resolve(archive),
     meta: path.resolve(meta),
     link: path.resolve(link),
     temporary: path.resolve(temporary),
-    archiveListFile,
+    isFileSystemLockable: await isFileSystemLockable(path.resolve(meta)),
   };
   const inputUrls: string[] = [];
   const rl = readline.createInterface(process.stdin);
@@ -477,9 +509,6 @@ export async function downloadAction(args, options) {
     inputUrls.push(line);
   });
   rl.on("close", async () => {
-    if (archiveListFile !== defaultArchiveFileList) {
-      await fs.promises.copyFile(defaultArchiveFileList, archiveListFile);
-    }
     const { progress, urls } = await currentProgress(inputUrls, config);
     const context: DownloadContext = { config, progress };
     let list = urls;
@@ -489,12 +518,6 @@ export async function downloadAction(args, options) {
         break;
       }
       list = next;
-    }
-    if (archiveListFile !== defaultArchiveFileList) {
-      await fs.promises.copyFile(archiveListFile, defaultArchiveFileList);
-    }
-    if (tempdir) {
-      await fs.promises.rmdir(tempdir, { recursive: true });
     }
   });
 }
