@@ -449,6 +449,14 @@ async function currentProgress(
       metaFiles.push(path.basename(file.name));
     }
   }
+  const archivedVideoId: string[] = [];
+  for (const line of (await fs.promises.readFile(path.join(meta, "all.txt"))).toString("utf-8").split("\n")) {
+    if (line.startsWith("#")) {
+      continue;
+    }
+    const [_, videoId] = line.split(" ");
+    archivedVideoId.push(videoId);
+  }
   const nextUrls: string[] = [];
   let numVideos = 0;
   let numChannels = 0;
@@ -470,6 +478,8 @@ async function currentProgress(
       }, 0);
       const videoOk = count === 1;
       if (metaOk && videoOk) {
+        finishedVideos++;
+      } else if (archivedVideoId.includes(videoId)) {
         finishedVideos++;
       } else {
         nextUrls.push(url);
